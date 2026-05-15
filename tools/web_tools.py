@@ -197,6 +197,15 @@ def _get_capability_backend(capability: str) -> str:
     """
     cfg = _load_web_config()
     specific = (cfg.get(f"{capability}_backend") or "").lower().strip()
+    if specific:
+        try:
+            from agent.web_search_registry import get_provider as _get_web_provider
+
+            provider = _get_web_provider(specific)
+            if provider is not None:
+                return specific
+        except Exception:
+            pass
     if specific and _is_backend_available(specific):
         return specific
     return _get_backend()
@@ -267,6 +276,7 @@ def _web_requires_env() -> list[str]:
         "TOOL_GATEWAY_DOMAIN",
         "TOOL_GATEWAY_SCHEME",
         "TOOL_GATEWAY_USER_TOKEN",
+        "OPENAI_API_KEY",
     ]
 
 
@@ -1335,7 +1345,22 @@ async def web_crawl_tool(
 # Convenience function to check Firecrawl credentials
 def check_web_api_key() -> bool:
     """Check whether the configured web backend is available."""
-    configured = _load_web_config().get("backend", "").lower().strip()
+    cfg = _load_web_config()
+    configured = (
+        cfg.get("search_backend")
+        or cfg.get("extract_backend")
+        or cfg.get("backend")
+        or ""
+    ).lower().strip()
+    if configured:
+        try:
+            from agent.web_search_registry import get_provider as _get_web_provider
+
+            provider = _get_web_provider(configured)
+            if provider is not None:
+                return bool(provider.is_available())
+        except Exception:
+            pass
     if configured in {"exa", "parallel", "firecrawl", "tavily", "searxng", "brave-free", "ddgs"}:
         return _is_backend_available(configured)
     return any(

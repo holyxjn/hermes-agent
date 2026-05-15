@@ -1,0 +1,7 @@
+name: sub2api-web-search
+version: 0.1.0
+description: "Hermes web_search backend backed by an OpenAI-compatible /responses endpoint that supports type=web_search."
+author: local
+kind: backend
+provides_web_providers:
+  - sub2api-web-search
