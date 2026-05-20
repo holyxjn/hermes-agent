@@ -19,6 +19,14 @@ Selection precedence (first hit wins):
 2. ``image_gen.openai.model`` in ``config.yaml``
 3. ``image_gen.model`` in ``config.yaml`` (when it's one of our tier IDs)
 4. :data:`DEFAULT_MODEL` — ``gpt-image-2-medium``
+
+Endpoint selection for OpenAI-compatible relays:
+
+1. ``OPENAI_IMAGE_BASE_URL`` env var
+2. ``image_gen.openai.base_url`` in ``config.yaml``
+3. ``image_gen.base_url`` in ``config.yaml``
+4. top-level ``model.base_url`` when ``model.provider`` is ``custom``
+5. OpenAI SDK default endpoint
 """
 
 from __future__ import annotations
@@ -90,6 +98,47 @@ def _load_openai_config() -> Dict[str, Any]:
     except Exception as exc:
         logger.debug("Could not load image_gen config: %s", exc)
         return {}
+
+
+def _load_full_config() -> Dict[str, Any]:
+    """Read the full Hermes config.yaml (returns {} on any failure)."""
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        return cfg if isinstance(cfg, dict) else {}
+    except Exception as exc:
+        logger.debug("Could not load Hermes config: %s", exc)
+        return {}
+
+
+def _resolve_base_url() -> Optional[str]:
+    """Resolve an optional OpenAI-compatible image endpoint base URL."""
+    env_override = os.environ.get("OPENAI_IMAGE_BASE_URL")
+    if env_override and env_override.strip():
+        return env_override.strip()
+
+    cfg = _load_full_config()
+    image_section = cfg.get("image_gen")
+    image_cfg = image_section if isinstance(image_section, dict) else {}
+    openai_section = image_cfg.get("openai")
+    openai_cfg = openai_section if isinstance(openai_section, dict) else {}
+
+    for candidate in (
+        openai_cfg.get("base_url") if isinstance(openai_cfg, dict) else None,
+        image_cfg.get("base_url") if isinstance(image_cfg, dict) else None,
+    ):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+
+    model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
+    provider = model_cfg.get("provider") if isinstance(model_cfg, dict) else None
+    base_url = model_cfg.get("base_url") if isinstance(model_cfg, dict) else None
+    if isinstance(provider, str) and provider.strip() == "custom":
+        if isinstance(base_url, str) and base_url.strip():
+            return base_url.strip()
+
+    return None
 
 
 def _resolve_model() -> Tuple[str, Dict[str, Any]]:
@@ -223,7 +272,11 @@ class OpenAIImageGenProvider(ImageGenProvider):
         }
 
         try:
-            client = openai.OpenAI()
+            client_kwargs: Dict[str, Any] = {}
+            base_url = _resolve_base_url()
+            if base_url:
+                client_kwargs["base_url"] = base_url
+            client = openai.OpenAI(**client_kwargs)
             response = client.images.generate(**payload)
         except Exception as exc:
             logger.debug("OpenAI image generation failed", exc_info=True)
