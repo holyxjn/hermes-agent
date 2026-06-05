@@ -192,7 +192,7 @@ def _get_capability_backend(capability: str) -> str:
             from agent.web_search_registry import get_provider as _get_web_provider
 
             provider = _get_web_provider(specific)
-            if provider is not None:
+            if provider is not None and provider.is_available():
                 return specific
         except Exception:
             pass
