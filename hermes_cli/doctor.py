@@ -1151,7 +1151,53 @@ def run_doctor(args):
             conn.close()
             check_ok(f"{_DHH}/state.db exists ({count} sessions)")
         except Exception as e:
-            check_warn(f"{_DHH}/state.db exists but has issues: {e}")
+            from hermes_state import is_malformed_db_error, repair_state_db_schema
+
+            if is_malformed_db_error(e):
+                # sqlite_master itself is malformed (e.g. duplicate
+                # messages_fts) — every statement fails before it runs, so
+                # this is NOT a plain FTS-index rebuild. Repair sqlite_master
+                # in place (backup first; sessions/messages preserved).
+                check_warn(
+                    f"{_DHH}/state.db schema is malformed (sessions hidden until repaired)",
+                    f"({e})",
+                )
+                if should_fix:
+                    report = repair_state_db_schema(state_db_path)
+                    if report.get("repaired"):
+                        try:
+                            conn = sqlite3.connect(str(state_db_path))
+                            count = conn.execute(
+                                "SELECT COUNT(*) FROM sessions"
+                            ).fetchone()[0]
+                            conn.close()
+                        except Exception:
+                            count = "?"
+                        backup_name = (
+                            Path(report["backup_path"]).name
+                            if report.get("backup_path") else "n/a"
+                        )
+                        check_ok(
+                            f"Repaired state.db schema ({count} sessions recovered)",
+                            f"(strategy: {report.get('strategy')}; backup: {backup_name})",
+                        )
+                        fixed_count += 1
+                    else:
+                        check_warn(
+                            "state.db schema repair did not recover automatically",
+                            f"({report.get('error')}; backup: {report.get('backup_path')})",
+                        )
+                        issues.append(
+                            "state.db schema malformed and auto-repair failed — "
+                            "restore from the backup copy beside state.db"
+                        )
+                else:
+                    issues.append(
+                        "state.db schema malformed — run 'hermes doctor --fix' "
+                        "(or 'hermes sessions repair') to recover hidden sessions"
+                    )
+            else:
+                check_warn(f"{_DHH}/state.db exists but has issues: {e}")
     else:
         check_info(f"{_DHH}/state.db not created yet (will be created on first session)")
 
@@ -1497,8 +1543,14 @@ def run_doctor(args):
                 total = critical + high + moderate
                 # Determine a scoped fix command for the remediation hint.
                 if audit_extra and audit_extra[0] == "--workspace":
-                    fix_scope = " ".join(audit_extra)
-                    fix_cmd = f"cd {npm_dir} && npm audit fix {fix_scope}"
+                    # Detection (`npm audit --workspace <name>`) is read-only and
+                    # safe, but `npm audit fix --workspace <name>` crashes on
+                    # current npm with "Cannot read properties of null (reading
+                    # 'edgesOut')" — an arborist bug with workspace-filtered
+                    # audit fix. The root-level `npm audit fix` can crash on the
+                    # same tree with "isDescendantOf", so do not hand the user a
+                    # manual fix command for these build-tool advisories.
+                    fix_cmd = None
                 elif audit_extra == ["--workspaces=false"]:
                     fix_cmd = f"cd {npm_dir} && npm audit fix --workspaces=false"
                 else:
@@ -1506,10 +1558,30 @@ def run_doctor(args):
                 if total == 0:
                     check_ok(f"{label} deps", "(no known vulnerabilities)")
                 elif critical > 0 or high > 0:
+                    if fix_cmd:
+                        vuln_detail = (
+                            f"{critical} critical, {high} high, {moderate} moderate — run: {fix_cmd}"
+                        )
+                    else:
+                        vuln_detail = (
+                            f"{critical} critical, {high} high, {moderate} moderate — "
+                            "build-tool advisory; clears via lockfile bump"
+                        )
                     check_warn(
                         f"{label} deps",
-                        f"({critical} critical, {high} high, {moderate} moderate — run: {fix_cmd})"
+                        f"({vuln_detail})"
                     )
+                    if audit_extra and audit_extra[0] == "--workspace":
+                        # The web/ui-tui workspace advisories are in build-time
+                        # tooling (esbuild/vite, etc.), not runtime code that ships
+                        # to users. Manual npm remediation may error with a known
+                        # arborist crash (edgesOut / isDescendantOf) on this monorepo
+                        # tree — in that case it is an npm bug, not a Hermes one.
+                        check_info(
+                            "  ^ build-time tooling (not runtime); if manual npm remediation "
+                            "errors with an arborist crash it's a known npm bug — clears "
+                            "via a lockfile bump"
+                        )
                     issues.append(
                         f"{label} has {total} npm "
                         f"{'vulnerability' if total == 1 else 'vulnerabilities'}"
