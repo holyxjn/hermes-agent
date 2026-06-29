@@ -39,6 +39,14 @@ _SECRET_SOURCES: dict[str, str] = {}
 _APPLIED_HOMES: set[str] = set()
 
 
+def _path_exists(path: Path) -> bool:
+    """Return whether *path* exists, treating inaccessible paths as absent."""
+    try:
+        return path.exists()
+    except OSError:
+        return False
+
+
 def get_secret_source(env_var: str) -> str | None:
     """Return the label of the secret source that supplied ``env_var``, if any.
 
@@ -143,17 +151,21 @@ def _sanitize_loaded_credentials() -> None:
         )
 
 
-def _load_dotenv_with_fallback(path: Path, *, override: bool) -> None:
+def _load_dotenv_with_fallback(path: Path, *, override: bool) -> bool:
     try:
-        load_dotenv(dotenv_path=path, override=override, encoding="utf-8")
-    except UnicodeDecodeError:
-        load_dotenv(dotenv_path=path, override=override, encoding="latin-1")
+        try:
+            load_dotenv(dotenv_path=path, override=override, encoding="utf-8")
+        except UnicodeDecodeError:
+            load_dotenv(dotenv_path=path, override=override, encoding="latin-1")
+    except OSError:
+        return False
     # Strip non-ASCII characters from credential env vars that were just
     # loaded.  API keys must be pure ASCII since they're sent as HTTP
     # header values (httpx encodes headers as ASCII).  Non-ASCII chars
     # typically come from copy-pasting keys from PDFs or rich-text editors
     # that substitute Unicode lookalike glyphs (e.g. ʋ U+028B for v).
     _sanitize_loaded_credentials()
+    return True
 
 
 def _sanitize_env_file_if_needed(path: Path) -> None:
@@ -172,7 +184,7 @@ def _sanitize_env_file_if_needed(path: Path) -> None:
     already knows all valid Hermes env-var names and can split
     concatenated lines correctly.
     """
-    if not path.exists():
+    if not _path_exists(path):
         return
     try:
         from hermes_cli.config import _sanitize_env_lines
@@ -229,17 +241,24 @@ def load_hermes_dotenv(
     project_env_path = Path(project_env) if project_env else None
 
     # Fix corrupted .env files before python-dotenv parses them (#8908).
-    if user_env.exists():
+    user_env_exists = _path_exists(user_env)
+    project_env_exists = bool(project_env_path and _path_exists(project_env_path))
+
+    if user_env_exists:
         _sanitize_env_file_if_needed(user_env)
-    if project_env_path and project_env_path.exists():
+    if project_env_exists and project_env_path:
         _sanitize_env_file_if_needed(project_env_path)
 
-    if user_env.exists():
-        _load_dotenv_with_fallback(user_env, override=True)
+    if user_env_exists:
+        if not _load_dotenv_with_fallback(user_env, override=True):
+            user_env_exists = False
+    if user_env_exists:
         loaded.append(user_env)
 
-    if project_env_path and project_env_path.exists():
-        _load_dotenv_with_fallback(project_env_path, override=not loaded)
+    if project_env_exists and project_env_path:
+        if not _load_dotenv_with_fallback(project_env_path, override=not loaded):
+            project_env_exists = False
+    if project_env_exists and project_env_path:
         loaded.append(project_env_path)
 
     _apply_external_secret_sources(home_path)
@@ -274,7 +293,7 @@ def _apply_managed_env() -> None:
     if managed_dir is None:
         return
     managed_env = managed_dir / ".env"
-    if not managed_env.exists():
+    if not _path_exists(managed_env):
         return
     _sanitize_env_file_if_needed(managed_env)
     _load_dotenv_with_fallback(managed_env, override=True)

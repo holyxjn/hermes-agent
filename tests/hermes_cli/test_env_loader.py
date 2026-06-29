@@ -1,6 +1,7 @@
 import importlib
 import os
 import sys
+from pathlib import Path
 
 from hermes_cli.env_loader import load_hermes_dotenv
 
@@ -84,6 +85,25 @@ def test_null_bytes_in_user_env_are_stripped(tmp_path, monkeypatch):
     assert loaded == [env_file]
     assert os.getenv("GLM_API_KEY") == "abc"
     assert os.getenv("OPENAI_API_KEY") == "sk-123"
+
+
+def test_inaccessible_project_env_is_skipped(tmp_path, monkeypatch):
+    home = tmp_path / "hermes"
+    home.mkdir()
+    project_env = tmp_path / ".env"
+
+    original_exists = Path.exists
+
+    def _exists(path: Path) -> bool:
+        if path == project_env:
+            raise PermissionError("sandbox denied")
+        return original_exists(path)
+
+    monkeypatch.setattr(Path, "exists", _exists)
+
+    loaded = load_hermes_dotenv(hermes_home=home, project_env=project_env)
+
+    assert loaded == []
 
 
 def test_main_import_applies_user_env_over_shell_values(tmp_path, monkeypatch):
