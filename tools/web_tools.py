@@ -174,11 +174,9 @@ def _get_backend(capability: str = "search") -> str:
     Falls back to whichever API key is present for users who configured
     keys manually without running setup.
 
-    ``capability`` ("search" | "extract") only affects auto-detect: for
-    ``extract`` we skip search-only backends (``_SEARCH_ONLY_BACKENDS``) so a
-    search-only credential never shadows the keyless Parallel free-MCP extract
-    fallback. An explicit ``web.backend`` value is honored as-is (explicit wins,
-    surfacing that backend's own search-only error rather than rerouting).
+    ``capability`` is accepted for compatibility with the per-capability
+    helpers; shared fallback selection still follows the legacy backend
+    priority.
     """
     configured = (_load_web_config().get("backend") or "").lower().strip()
     if configured in _KNOWN_WEB_BACKENDS:
@@ -190,8 +188,7 @@ def _get_backend(capability: str = "search") -> str:
     # pre-empted by a Nous OAuth token whose subscription tier may not
     # actually grant web-search access (the gateway then fails at runtime
     # with "no subscription" and the tool returns an error to the agent
-    # without falling back). Free-tier backends (searxng / brave-free /
-    # keyless parallel / ddgs) trail the keyed ones.
+    # without falling back). Free-tier backends trail the paid ones.
     backend_candidates = (
         ("tavily", _has_env("TAVILY_API_KEY")),
         ("exa", _has_env("EXA_API_KEY")),
@@ -200,20 +197,13 @@ def _get_backend(capability: str = "search") -> str:
         ("firecrawl", _is_tool_gateway_ready()),
         ("searxng", _has_env("SEARXNG_URL")),
         ("brave-free", _has_env("BRAVE_SEARCH_API_KEY")),
-        # Keyless Parallel free MCP — always available, the intended no-key
-        # default for both search and extract. Ahead of ddgs (search-only, so it
-        # can't service web_extract); ddgs stays reachable via web.backend=ddgs.
-        ("parallel", True),
         ("ddgs", _ddgs_package_importable()),
     )
     for backend, available in backend_candidates:
-        if not available:
-            continue
-        if capability == "extract" and backend in _SEARCH_ONLY_BACKENDS:
-            continue
-        return backend
+        if available:
+            return backend
 
-    return "parallel"
+    return "firecrawl"  # default (backward compat)
 
 
 def _get_search_backend() -> str:
@@ -244,17 +234,12 @@ def _get_extract_backend() -> str:
 def _get_capability_backend(capability: str) -> str:
     """Shared helper for per-capability backend selection.
 
-    Reads ``web.{capability}_backend`` from config. Any explicit value is
-    honored **regardless of availability** — including unrecognized typos like
-    ``parrallel`` — so the dispatcher surfaces that backend's own setup/config
-    error rather than silently rerouting to the keyless Parallel default (which
-    would send user queries to a different provider and hide the
-    misconfiguration). This matches ``web_search_registry``'s "explicit config
-    wins" rule. Only an *unset* value falls through to ``_get_backend()``.
+    Reads ``web.{capability}_backend`` from config; if set and available,
+    uses it. Otherwise falls through to the shared ``_get_backend()``.
     """
     cfg = _load_web_config()
     specific = (cfg.get(f"{capability}_backend") or "").lower().strip()
-    if specific:
+    if specific and _is_backend_available(specific):
         return specific
     return _get_backend(capability)
 
@@ -277,6 +262,15 @@ def _is_backend_available(backend: str) -> bool:
         return _has_env("BRAVE_SEARCH_API_KEY")
     if backend == "ddgs":
         return _ddgs_package_importable()
+    if backend == "sub2api-web-search":
+        _ensure_web_plugins_loaded()
+        try:
+            from agent.web_search_registry import get_provider
+
+            provider = get_provider("sub2api-web-search")
+            return bool(provider and provider.is_available())
+        except Exception:
+            return False
     if backend == "xai":
         # Cheap probe — env var OR auth.json has OAuth tokens. Must not
         # call resolve_xai_http_credentials() here because the OAuth path
@@ -1006,6 +1000,7 @@ async def web_extract_tool(
     }
     
     try:
+        _ensure_web_plugins_loaded()
         logger.info("Extracting content from %d URL(s)", len(normalized_urls))
 
         # ── SSRF protection — filter out private/internal URLs before any backend ──
@@ -1258,17 +1253,11 @@ def _parallel_provider_registered() -> bool:
 
 
 def _backend_usable(backend: str) -> bool:
-    """True when *backend* can service calls. Keyless Parallel counts (free MCP).
+    """True when *backend* can service calls.
 
     Unknown/typo'd backend names are not usable (so an explicit typo is reported
     as a config problem rather than masked by the keyless fallback).
     """
-    if backend == "parallel" and not _has_env("PARALLEL_API_KEY"):
-        # Keyless Parallel is only genuinely usable when its provider is actually
-        # registered/enabled. If web-parallel is disabled or discovery failed,
-        # report unusable so setup is not skipped and the user is not left with
-        # web tools that fail at runtime ("No web search provider configured").
-        return _parallel_provider_registered()
     if _is_backend_available(backend):
         return True
     _ensure_web_plugins_loaded()
@@ -1290,9 +1279,8 @@ def check_web_api_key() -> bool:
     :func:`_get_extract_backend` actually select (not just shared
     ``web.backend``), so an explicit per-capability backend with missing
     credentials — or a typo'd name — reports unusable instead of being masked by
-    the keyless Parallel fallback. Keyless Parallel itself genuinely services
-    calls, so a zero-setup install reports usable. Distinct from
-    :func:`web_tools_registered` (always True — whether the tool is offered).
+    another available backend. Distinct from :func:`web_tools_registered`
+    (always True — whether the tool is offered).
     """
     return _backend_usable(_get_search_backend()) and _backend_usable(_get_extract_backend())
 
