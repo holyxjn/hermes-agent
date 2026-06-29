@@ -209,14 +209,10 @@ def _get_backend(capability: str = "search") -> str:
     for backend, available in backend_candidates:
         if not available:
             continue
-        # For extract, skip search-only backends so the keyless Parallel
-        # free-MCP fallback (which can fetch URLs) is reached instead.
         if capability == "extract" and backend in _SEARCH_ONLY_BACKENDS:
             continue
         return backend
 
-    # Defensive terminal (the keyless ``parallel`` candidate above is always
-    # available, so this is effectively unreachable).
     return "parallel"
 
 
@@ -823,17 +819,6 @@ def _ensure_web_plugins_loaded() -> None:
     Mirrors :func:`tools.browser_tool._ensure_browser_plugins_loaded` exactly:
     the underlying discovery call is idempotent and cheap on subsequent
     invocations.
-
-    Triggering discovery is necessary but not *sufficient*: the sweep can
-    finish without registering the bundled web providers (its exception
-    swallowed below as a warning, a packaged layout where discovery ran before
-    the bundled tree was importable, or a stale empty-discovery cache). When
-    that happens the registry is empty and *both* web_search and web_extract
-    dead-end on "No web {search,extract} provider configured" — even though the
-    keyless Parallel default is supposed to work with zero setup. So after
-    discovery we verify the keyless default landed and, if not, register the
-    bundled providers directly (see
-    :func:`_register_bundled_web_providers_directly`).
     """
     try:
         from hermes_cli.plugins import _ensure_plugins_discovered
@@ -845,87 +830,6 @@ def _ensure_web_plugins_loaded() -> None:
         # configured" error this helper is meant to eliminate, with no
         # clue in normal logs about the real cause.
         logger.warning("Web plugin discovery failed (non-fatal): %s", exc)
-
-    # Belt-and-suspenders: guarantee the keyless Parallel default (the
-    # documented zero-setup backend for both web_search and web_extract) is
-    # actually registered. The lookup is a cheap dict hit on the healthy path
-    # (discovery already registered it → no-op); only an empty registry pays
-    # for the direct-registration sweep.
-    try:
-        from agent.web_search_registry import get_provider
-
-        if get_provider("parallel") is None:
-            _register_bundled_web_providers_directly()
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("Bundled web provider fallback check failed: %s", exc)
-
-
-def _register_bundled_web_providers_directly() -> None:
-    """Register the repo's bundled web providers without the plugin manager.
-
-    The normal path is the general plugin sweep
-    (:func:`hermes_cli.plugins._ensure_plugins_discovered`), which auto-loads
-    every ``plugins/web/<name>`` backend (they are ``kind: backend``). This
-    fallback exists for the runtimes where that sweep does not leave the web
-    registry populated — so the keyless Parallel default (and any bundled
-    backend the user explicitly configured) keeps working instead of
-    surfacing a misleading "No web provider configured" error.
-
-    Imports each bundled ``plugins/web/<name>`` package and calls its
-    ``register()`` directly against :mod:`agent.web_search_registry`. Idempotent
-    (re-register overwrites) and honors an explicit ``plugins.disabled`` entry
-    so a backend the user turned off stays off.
-    """
-    try:
-        from hermes_cli.plugins import (
-            _get_disabled_plugins,
-            get_bundled_plugins_dir,
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("Bundled web provider fallback unavailable: %s", exc)
-        return
-
-    web_dir = get_bundled_plugins_dir() / "web"
-    if not web_dir.is_dir():
-        return
-
-    disabled = _get_disabled_plugins()
-
-    from agent.web_search_provider import WebSearchProvider
-    from agent.web_search_registry import register_provider
-
-    class _DirectRegistrationCtx:
-        """Minimal plugin ctx exposing only web-provider registration."""
-
-        def register_web_search_provider(self, provider) -> None:
-            if isinstance(provider, WebSearchProvider):
-                register_provider(provider)
-
-    ctx = _DirectRegistrationCtx()
-    import importlib
-
-    for child in sorted(web_dir.iterdir()):
-        if not child.is_dir():
-            continue
-        if not (child / "plugin.yaml").exists() and not (child / "plugin.yml").exists():
-            continue
-        # Respect an explicit disable — match discover_and_load's key/name
-        # check (key ``web/<dir>``; manifest name ``web-<dir-with-dashes>``).
-        if (
-            f"web/{child.name}" in disabled
-            or f"web-{child.name.replace('_', '-')}" in disabled
-        ):
-            continue
-        try:
-            module = importlib.import_module(f"plugins.web.{child.name}")
-            register_fn = getattr(module, "register", None)
-            if callable(register_fn):
-                register_fn(ctx)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug(
-                "Direct registration of bundled web provider '%s' failed: %s",
-                child.name, exc,
-            )
 
 
 def web_search_tool(query: str, limit: int = 5) -> str:
@@ -1116,19 +1020,11 @@ async def web_extract_tool(
             else:
                 safe_urls.append(url)
 
-        # Tracks the free-tier Parallel extract path (no key → web_fetch via the
-        # hosted Search MCP) so we can credit Parallel in the output/UI. Bound
-        # here so empty/all-blocked inputs (which skip dispatch) stay defined.
-        _free_parallel_extract = False
-
         # Dispatch only safe URLs to the configured backend
         if not safe_urls:
             results = []
         else:
             backend = _get_extract_backend()
-            _free_parallel_extract = (
-                backend == "parallel" and not _has_env("PARALLEL_API_KEY")
-            )
 
             # All seven providers (brave-free, ddgs, searxng, exa, parallel,
             # tavily, firecrawl) now live as plugins. The dispatcher is a
@@ -1302,14 +1198,6 @@ async def web_extract_tool(
             for r in response.get("results", [])
         ]
         trimmed_response = {"results": trimmed_results}
-        if _free_parallel_extract:
-            # Credit Parallel's free Search MCP (drives the "[Parallel]" UI tag
-            # + lets the model cite the source). Free tier only.
-            trimmed_response["provider"] = "parallel"
-            trimmed_response["attribution"] = (
-                "Extraction powered by the free Parallel Web Search MCP "
-                "(https://parallel.ai)."
-            )
 
         if trimmed_response.get("results") == []:
             result_json = tool_error("Content was inaccessible or not found")
@@ -1574,7 +1462,7 @@ registry.register(
     toolset="web",
     schema=WEB_SEARCH_SCHEMA,
     handler=lambda args, **kw: web_search_tool(args.get("query", ""), limit=args.get("limit", 5)),
-    check_fn=web_tools_registered,
+    check_fn=check_web_api_key,
     requires_env=_web_requires_env(),
     emoji="🔍",
     max_result_size_chars=100_000,
@@ -1585,7 +1473,7 @@ registry.register(
     schema=WEB_EXTRACT_SCHEMA,
     handler=lambda args, **kw: web_extract_tool(
         args.get("urls", [])[:5] if isinstance(args.get("urls"), list) else [], "markdown"),
-    check_fn=web_tools_registered,
+    check_fn=check_web_api_key,
     requires_env=_web_requires_env(),
     is_async=True,
     emoji="📄",
